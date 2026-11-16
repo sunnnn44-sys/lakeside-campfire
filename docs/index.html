@@ -351,6 +351,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
 
   /* ---------- 숲 ---------- */
   const TREE_N = isMobile ? 520 : 1000;
+  const treeColliders = [];
   const trunkGeo = new THREE.CylinderGeometry(0.12, 0.2, 1.4, 5); trunkGeo.translate(0, 0.7, 0);
   const cone1 = new THREE.ConeGeometry(1.35, 3.3, 7); cone1.translate(0, 2.6, 0);
   const cone2 = new THREE.ConeGeometry(0.95, 2.5, 7); cone2.translate(0, 4.1, 0);
@@ -372,6 +373,8 @@ button.primary{border-color:var(--ember);color:var(--ember)}
       q.setFromAxisAngle(up, Math.random() * Math.PI * 2);
       sc.set(s, s * (0.85 + Math.random() * 0.5), s);
       m4.compose(ps, q, sc);
+      // 카메라 막힘 검사용: 모닥불 가까운 나무의 잎(원기둥으로 근사)과 줄기 크기
+      if (Math.hypot(x, z) < 32) treeColliders.push({ x, z, r: 1.2 * s, y0: ps.y + 0.85 * sc.y, y1: ps.y + 6.3 * sc.y, tr: 0.25 * s, base: ps.y });
       trunks.setMatrixAt(placed, m4);
       tmp.setHSL(0.36 + Math.random() * 0.08, 0.35 + Math.random() * 0.2, 0.07 + Math.random() * 0.05);
       leaves.forEach(l => { l.setMatrixAt(placed, m4); l.setColorAt(placed, tmp); });
@@ -711,6 +714,27 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   const mShine = new THREE.MeshBasicMaterial({ color: 0xffffff });
   const mBlush = new THREE.MeshBasicMaterial({ color: 0xff7d8a, transparent: true, opacity: 0.55, depthWrite: false });
   const mPink = new THREE.MeshStandardMaterial({ color: 0xf4a3b0, roughness: 0.8 });
+  /* 달빛 테두리(rim light): 동물 재질에만 넣는다.
+     보는 방향과 면이 비스듬할수록(윤곽) 옅은 달빛색을 더하고, 모닥불에서 2.5m 안은 0, 7m부터 최대가 된다. */
+  const RIM = { uFireView: { value: new THREE.Vector3() }, uRimColor: { value: new THREE.Color(0x9fb4ff) } };
+  const FIRE_WORLD = new THREE.Vector3(0, G0 + 0.6, 0);
+  function addRim(mat) {
+    if (mat.userData.rim) return;
+    mat.userData.rim = true;
+    mat.onBeforeCompile = shader => {
+      shader.uniforms.uFireView = RIM.uFireView;
+      shader.uniforms.uRimColor = RIM.uRimColor;
+      shader.fragmentShader = "uniform vec3 uFireView;\nuniform vec3 uRimColor;\n" + shader.fragmentShader.replace(
+        "#include <emissivemap_fragment>",
+        `#include <emissivemap_fragment>
+        {
+          float rimF = pow(1.0 - clamp(dot(normal, normalize(vViewPosition)), 0.0, 1.0), 2.6);
+          float rimFar = smoothstep(2.5, 7.0, length(-vViewPosition - uFireView));
+          totalEmissiveRadiance += uRimColor * rimF * rimFar * 0.38;
+        }`);
+    };
+    mat.customProgramCacheKey = () => "moon-rim-1";
+  }
   function ball(mat, sx, sy, sz, x, y, z, parent) {
     const m = new THREE.Mesh(SPH, mat); m.scale.set(sx, sy, sz); m.position.set(x, y, z); parent.add(m); return m;
   }
@@ -838,7 +862,10 @@ button.primary{border-color:var(--ember);color:var(--ember)}
       ball(fur, 0.05, 0.05, 0.05, 0, 0.1, -0.21, bodyG);
     }
 
-    root.traverse(c => { c.userData.friend = root; });
+    root.traverse(c => {
+      c.userData.friend = root;
+      if (c.isMesh && c.material && c.material.isMeshStandardMaterial) addRim(c.material);   // 달빛 테두리
+    });
 
     // 이름표 (머리 위)
     const tag = new THREE.Sprite(new THREE.SpriteMaterial({ transparent: true, depthTest: false, depthWrite: false, opacity: 0 }));
@@ -2004,7 +2031,54 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     lookB.set(camCenter.x - s * r2b, camCenter.y + 0.6 + 0.3 * u, camCenter.z - c * r2b);
     camera.position.lerpVectors(camA, camB, followK);
     lookTarget.lerpVectors(lookA, lookB, followK);
+    // 막힘 피하기: 바라보는 대상(내 동물 또는 모닥불)에서 카메라까지 나무·언덕에 걸리면 걸리기 0.35m 앞까지 당긴다 (1.2m보다는 가까이 오지 않음)
+    camOrigin.lerpVectors(tmpC.set(0, G0 + 1.0, 0), camOriginB.set(camCenter.x, camCenter.y + 0.9, camCenter.z), followK);
+    const len = camera.position.distanceTo(camOrigin);
+    let want = occlusionT(camOrigin, camera.position);
+    if (want < 1) want = Math.min(1, Math.max(1.2 / Math.max(len, 1e-3), want - 0.35 / Math.max(len, 1e-3)));
+    armK += (want - armK) * Math.min(1, dt * (want < armK ? 14 : 2.5));   // 당길 때는 빠르게, 물러날 때는 천천히
+    if (armK < 0.999) {
+      camera.position.sub(camOrigin).multiplyScalar(armK).add(camOrigin);
+      camera.position.y += (1 - armK) * 0.35;
+    }
     camera.lookAt(lookTarget);
+  }
+
+  const camOrigin = new THREE.Vector3(), camOriginB = new THREE.Vector3();
+  let armK = 1;
+  // 선분 o→c가 처음 나무(잎·줄기)나 언덕에 닿는 비율(0~1). 안 닿으면 1.
+  function occlusionT(o, c) {
+    const dx = c.x - o.x, dy = c.y - o.y, dz = c.z - o.z, a = dx * dx + dz * dz;
+    let tHit = 1;
+    for (const tr of treeColliders) {
+      const fx = o.x - tr.x, fz = o.z - tr.z;
+      if (fx * fx + fz * fz > 400) continue;   // 20m 밖 나무는 건너뛴다
+      for (let part = 0; part < 2; part++) {
+        const r = part ? tr.tr : tr.r, yLo = part ? tr.base : tr.y0, yHi = part ? tr.y0 : tr.y1;
+        const b = 2 * (fx * dx + fz * dz), cc = fx * fx + fz * fz - r * r;
+        let t0, t1;
+        if (a < 1e-8) { if (cc > 0) continue; t0 = 0; t1 = 1; }
+        else {
+          const disc = b * b - 4 * a * cc;
+          if (disc < 0) continue;
+          const sq = Math.sqrt(disc); t0 = (-b - sq) / (2 * a); t1 = (-b + sq) / (2 * a);
+        }
+        t0 = Math.max(t0, 0); t1 = Math.min(t1, 1);
+        if (Math.abs(dy) > 1e-6) {
+          let ya = (yLo - o.y) / dy, yb = (yHi - o.y) / dy;
+          if (ya > yb) { const k = ya; ya = yb; yb = k; }
+          t0 = Math.max(t0, ya); t1 = Math.min(t1, yb);
+        } else if (o.y < yLo || o.y > yHi) continue;
+        if (t0 <= t1 && t0 < tHit) tHit = t0;
+      }
+    }
+    for (let k = 1; k <= 12; k++) {   // 언덕: 땅에 0.35m보다 가까워지는 곳 앞까지
+      const t = k / 12;
+      if (t >= tHit) break;
+      const x = o.x + dx * t, z = o.z + dz * t;
+      if (o.y + dy * t < groundH(x, z) + 0.35) { tHit = (k - 1) / 12; break; }
+    }
+    return tHit;
   }
 
   const pointers = new Map();
@@ -2311,6 +2385,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     renderer.setRenderTarget(reflectRT);
     renderer.clippingPlanes = [clipPlane];
     renderer.clear();
+    RIM.uFireView.value.copy(FIRE_WORLD).applyMatrix4(mirrorCam.matrixWorldInverse);   // 테두리 셰이더용 모닥불 위치(시점 공간)
     const tagVis = friends.map(f => f.tag.visible);
     friends.forEach(f => { f.tag.visible = false; });   // 이름표는 물에 비치지 않게
     const labelVis = boats.map(b => b.label ? b.label.visible : false);
@@ -2321,6 +2396,8 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     renderer.clippingPlanes = [];
     renderer.setRenderTarget(null);
     water.visible = true;
+    camera.updateMatrixWorld();
+    RIM.uFireView.value.copy(FIRE_WORLD).applyMatrix4(camera.matrixWorldInverse);
     renderer.render(scene, camera);
 
     requestAnimationFrame(frame);
