@@ -110,7 +110,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     <button id="btn-far" type="button">멀리서 보기</button>
     <button id="btn-sound" type="button" aria-pressed="false">불 소리 켜기</button>
   </div>
-  <p class="hint" id="hint">드래그로 둘러보기 · 두 손가락이나 휠로 거리 조절</p>
+  <p class="hint" id="hint">바닥을 누르거나 WASD·방향키로 걷기 · 드래그나 Q/E로 둘러보기 · 휠·두 손가락으로 거리 조절</p>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -334,7 +334,8 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   groundGeo.setAttribute("color", new THREE.BufferAttribute(gcol, 3));
   groundGeo.computeVertexNormals();
   const groundMat = new THREE.MeshStandardMaterial({ vertexColors: true, color: 0x8a7a68, roughness: 0.96, metalness: 0 });
-  scene.add(new THREE.Mesh(groundGeo, groundMat));
+  const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+  scene.add(groundMesh);
 
   /* ---------- 숲 ---------- */
   const TREE_N = isMobile ? 520 : 1000;
@@ -961,7 +962,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
 
   // 의자에 앉히기. walk=true면 지금 있는 곳(처음이면 숲)에서 걸어와 앉는다
   function seatFriend(f, seat, walk) {
-    cancelTrip(f);
+    leaveFree(f);
     vacate(f);
     f.seat = seat;
     if (seat < 0) { f.root.visible = false; f.shadow.visible = false; f.walk = null; return; }
@@ -986,7 +987,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
 
   // 숲으로 돌아가기 (다른 사람이 나갔을 때)
   function walkHome(f) {
-    cancelTrip(f);
+    leaveFree(f);
     if (f.seat < 0 || !f.root.visible) { removeFriend(f); return; }
     const th = SEATS[f.seat].th;
     vacate(f);
@@ -1034,7 +1035,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
         squeak();
         if (f.isMe) {
           btnWave.disabled = false; btnWarm.disabled = false;
-          document.getElementById("btn-boat").disabled = !!f.trip;
+          document.getElementById("btn-boat").disabled = !!me.trip;
           showStatus("자리에 앉았어요. 손을 흔들거나 불을 쬐어 보세요.");
           if (autoSit) { autoSit = false; sitDown(); }
         } else if (!discovering) {
@@ -1075,6 +1076,337 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     clearTimeout(statusTimer);
     statusTimer = setTimeout(() => statusEl.classList.add("gone"), 3200);
   }
+
+  /* ---------- 걸어 다니기 ----------
+     걸을 수 있는 곳: 모닥불에서 12m 안의 땅(땅 높이 0.1 이상).
+     막는 것: 호수, 모닥불(반지름 1.15m), 의자(각 0.5m), 장식 통나무, 서 있는 다른 사람(0.55m). 부딪히면 가장자리를 따라 미끄러진다. */
+  const WALK_R = 12, WALK_SPEED = 1.6, FIRE_BLOCK = 1.15, STOOL_BLOCK = 0.5, BODY_GAP = 0.55, SHORE_MIN = 0.1;
+  const RING = SEAT_R + 0.65;   // 의자 둘레 바깥으로 돌아가는 길
+  const stoolXZ = SEATS.map(s => ({ x: Math.sin(s.th) * SEAT_R, z: Math.cos(s.th) * SEAT_R }));
+  const benchAxis = { x: Math.cos(BENCH_THETA), z: -Math.sin(BENCH_THETA) };
+  const isLand = (x, z) => groundH(x, z) > SHORE_MIN;
+
+  function pushCircle(p, cx, cz, r) {
+    const dx = p.x - cx, dz = p.z - cz, d = Math.hypot(dx, dz);
+    if (d >= r) return;
+    if (d < 1e-6) { p.x = cx + r; return; }
+    p.x = cx + dx / d * r; p.z = cz + dz / d * r;
+  }
+  function pushStatic(p) {
+    pushCircle(p, 0, 0, FIRE_BLOCK);
+    for (const s of stoolXZ) pushCircle(p, s.x, s.z, STOOL_BLOCK);
+    const b = benchPos(), vx = p.x - b.x, vz = p.z - b.z;
+    const tt = Math.max(-1.15, Math.min(1.15, vx * benchAxis.x + vz * benchAxis.z));
+    pushCircle(p, b.x + benchAxis.x * tt, b.z + benchAxis.z * tt, 0.45);
+    const d = Math.hypot(p.x, p.z);
+    if (d > WALK_R) { p.x *= WALK_R / d; p.z *= WALK_R / d; }
+    return p;
+  }
+  function pushAll(x, z) {
+    const p = { x, z };
+    friends.forEach(o => { if (o !== me.friend && o.root.visible && o.free) pushCircle(p, o.free.x, o.free.z, BODY_GAP); });
+    return pushStatic(p);
+  }
+  // 한 걸음: 막힌 곳은 비켜 미끄러지고, 물가에서는 멈춘다
+  function resolveMove(ox, oz, nx, nz) {
+    let p = pushAll(nx, nz); if (isLand(p.x, p.z)) return p;
+    p = pushAll(nx, oz); if (isLand(p.x, p.z)) return p;
+    p = pushAll(ox, nz); if (isLand(p.x, p.z)) return p;
+    return { x: ox, z: oz };
+  }
+  // 받은 위치·누른 곳을 걸을 수 있는 곳 안으로 (물이면 출발점 쪽으로 물러나 가장 가까운 물가)
+  function clampWalk(x, z, fromX, fromZ) {
+    const p = pushStatic({ x, z });
+    if (isLand(p.x, p.z)) return p;
+    const ax = fromX === undefined ? 0 : fromX, az = fromZ === undefined ? 0 : fromZ;
+    const len = Math.hypot(ax - p.x, az - p.z), n = Math.max(1, Math.ceil(len / 0.08));
+    for (let k = 1; k <= n; k++) {
+      const s = k / n, qx = p.x + (ax - p.x) * s, qz = p.z + (az - p.z) * s;
+      if (isLand(qx, qz)) { const s2 = Math.min(1, s + 0.15 / Math.max(len, 0.15)); return pushStatic({ x: p.x + (ax - p.x) * s2, z: p.z + (az - p.z) * s2 }); }
+    }
+    return pushStatic({ x: ax, z: az });
+  }
+  // 길 찾기: 곧장 가다 모닥불이나 의자에 걸리면 의자 둘레 바깥 원을 따라 돌아간다
+  function segClear(ax, az, bx, bz) {
+    const vx = bx - ax, vz = bz - az, L2 = vx * vx + vz * vz || 1e-6;
+    const far = (cx, cz, r) => {
+      const t = Math.max(0, Math.min(1, ((cx - ax) * vx + (cz - az) * vz) / L2));
+      return Math.hypot(ax + vx * t - cx, az + vz * t - cz) >= r;
+    };
+    return far(0, 0, FIRE_BLOCK + 0.15) && stoolXZ.every(s => far(s.x, s.z, STOOL_BLOCK - 0.02));
+  }
+  function planPath(sx, sz, tx, tz) {
+    if (segClear(sx, sz, tx, tz)) return [{ x: tx, z: tz }];
+    const pts = [], a0 = Math.atan2(sx, sz), a1 = Math.atan2(tx, tz);
+    if (Math.hypot(sx, sz) < RING - 0.05) pts.push({ x: Math.sin(a0) * RING, z: Math.cos(a0) * RING });
+    const d = wrapPi(a1 - a0), steps = Math.max(1, Math.ceil(Math.abs(d) / 0.25));
+    for (let k = 1; k <= steps; k++) { const a = a0 + d * k / steps; pts.push(clampWalk(Math.sin(a) * RING, Math.cos(a) * RING)); }
+    pts.push({ x: tx, z: tz });
+    return pts;
+  }
+
+  // 서기·앉기 상태 (나와 다른 사람 모두)
+  function reserveSeat(f, seat) {
+    vacate(f); f.seat = seat;
+    if (seat >= 0) SEATS[seat].friend = f;
+  }
+  function placeFree(f, st) {
+    f.walk = null; f.trans = null;
+    f.free = { x: st.x, z: st.z, tx: st.x, tz: st.z, ry: st.ry, speed: 0, path: null };
+    f.root.visible = true; f.shadow.visible = true;
+    f.root.position.set(st.x, groundH(st.x, st.z), st.z); f.root.rotation.y = st.ry;
+    addFriendToScene(f);
+  }
+  function standUp(f, to) {
+    if (f.free || f.seat < 0) return;
+    const foot = to || seatFoot(SEATS[f.seat].th), from = f.root.position.clone();
+    f.walk = null; f.hop = 0;
+    f.trans = { t: 0, from, to: { x: foot.x, z: foot.z } };
+    f.free = { x: foot.x, z: foot.z, tx: foot.x, tz: foot.z, ry: Math.atan2(foot.x - from.x, foot.z - from.z), speed: 0, path: null };
+    f.root.visible = true; f.shadow.visible = true;
+    addFriendToScene(f);
+  }
+  function enterFreeRemote(f, st) {
+    if (f.walk || !f.root.visible || !friends.includes(f)) { placeFree(f, st); return; }
+    standUp(f, { x: st.x, z: st.z });
+  }
+  function leaveFree(f) {
+    if (!f) return;
+    dropCarry(f);
+    f.free = null; f.trans = null; f.act = ""; f.actT = 0;
+    f.bodyG.rotation.x = 0; f.bodyG.rotation.z = 0;
+    if (f.isMe && me.trip) { me.trip = null; document.getElementById("btn-boat").disabled = me.seat < 0; }
+  }
+  function setAct(f, act) {
+    if ((f.act || "") === act) return;
+    f.act = act; f.actT = 0;
+    if (act === "carry" && !f.carried) carryBoat(f, null);
+    if (act === "") dropCarry(f);   // 배를 내려놓기 전에 동작이 끝나면 들고 있던 배를 치운다
+    if (!f.isMe && act === "carry") showStatus(josa(f.name, "이", "가") + " 종이배를 들고 호숫가로 가요.");
+  }
+
+  // 손에 든 배
+  function carryBoat(f, text) {
+    dropCarry(f);
+    const b = makeBoat(text);
+    b.group.position.set(0, 0.27, 0.3);
+    f.bodyG.add(b.group); f.carried = b;
+  }
+  function dropCarry(f) {
+    const b = f && f.carried;
+    if (!b) return;
+    f.bodyG.remove(b.group);
+    if (b.label) { b.label.material.map.dispose(); b.label.material.dispose(); b.label = null; }
+    b.mat.dispose();
+    f.carried = null;
+  }
+  function launchFrom(f, x, z) {
+    let b = f.carried;
+    if (b) { f.bodyG.remove(b.group); f.carried = null; } else b = makeBoat(null);
+    b.group.position.set(x, 0.012, z);
+    b.dir.copy(new THREE.Vector2(LAKE.cx - x, LAKE.cz - z).normalize().rotateAround(new THREE.Vector2(), (Math.random() - 0.5) * 0.5));
+    b.group.rotation.set(0, Math.atan2(-b.dir.y, b.dir.x), 0);
+    b.floating = true; b.age = 0;
+    if (b.label) b.label.visible = true;
+    scene.add(b.group); boats.push(b);
+    while (boats.length > MAX_BOATS) removeBoat(boats[0]);
+    plop();
+  }
+
+  // 내 조작
+  const keys = new Set();
+  const MOVE_KEYS = { KeyW: [0, 1], ArrowUp: [0, 1], KeyS: [0, -1], ArrowDown: [0, -1], KeyA: [-1, 0], ArrowLeft: [-1, 0], KeyD: [1, 0], ArrowRight: [1, 0] };
+  let camFar = false;   // '멀리서 보기'를 누르면 불 중심 시점으로 고정
+  const marker = new THREE.Mesh(new THREE.RingGeometry(0.16, 0.23, 36),
+    new THREE.MeshBasicMaterial({ color: 0xffb46a, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }));
+  marker.rotation.x = -Math.PI / 2; marker.renderOrder = 3; marker.visible = false;
+  scene.add(marker);
+  let markerOnNow = false;
+  function markerOn(x, z) { marker.position.set(x, groundH(x, z) + 0.03, z); marker.visible = true; markerOnNow = true; }
+  function markerOff() { markerOnNow = false; }
+  function updateMarker(dt) {
+    const m = marker.material;
+    m.opacity += ((markerOnNow ? 0.85 : 0) - m.opacity) * Math.min(1, dt * 6);
+    marker.visible = m.opacity > 0.02;
+    const s = 1 + Math.sin(time * 5) * 0.08; marker.scale.set(s, s, s);
+  }
+
+  function onMeStood() {
+    camFar = false;
+    if (cur.rad < 5.5) goal.rad = 4.2;
+    pushState(true);
+  }
+  function setPath(path, onArrive) {
+    const fr = me.friend.free;
+    if (!fr) return;
+    fr.path = path; fr.onArrive = onArrive || null; fr.stuckT = 0;
+  }
+  function canAct() {
+    const f = me.friend;
+    if (me.trip) { showStatus("종이배를 띄우는 중이에요."); return false; }
+    return !f.walk && f.root.visible && me.seat >= 0;
+  }
+  // 바닥·호수를 눌렀을 때
+  function walkTo(x, z) {
+    if (!canAct()) return;
+    const f = me.friend;
+    if (!f.free) { standUp(f); onMeStood(); }
+    const fr = f.free, c = clampWalk(x, z, fr.x, fr.z);
+    markerOn(c.x, c.z);
+    setPath(planPath(fr.x, fr.z, c.x, c.z), null);
+  }
+  // 의자로 가서 앉기 (내 의자 또는 빈 의자)
+  function goSit(idx) {
+    if (!canAct()) return;
+    const f = me.friend;
+    if (!f.free && idx === me.seat) { camFar = false; sitDown(); return; }
+    const occ = SEATS[idx].friend;
+    if (occ && occ !== f) { occ.tagT = 3.5; return; }
+    if (!f.free) { standUp(f); onMeStood(); }
+    if (idx !== me.seat) { reserveSeat(f, idx); me.seat = idx; refreshHidden(); }
+    camFar = false; autoSit = true;
+    const foot = seatFoot(SEATS[idx].th), fr = f.free;
+    markerOn(foot.x, foot.z);
+    setPath(planPath(fr.x, fr.z, foot.x, foot.z), () => { markerOff(); seatFriend(f, idx, true); pushState(true); });
+    pushState(true);
+  }
+
+  // 종이배: 지금 있는 곳에서 가장 가까운 물가(호수 한가운데 쪽)로
+  function findShore(x, z) {
+    let dx = LAKE.cx - x, dz = LAKE.cz - z;
+    const l = Math.hypot(dx, dz); dx /= l; dz /= l;
+    let px = x, pz = z;
+    for (let k = 0; k < 400 && isLand(px, pz); k++) { px += dx * 0.05; pz += dz * 0.05; }
+    return { stand: clampWalk(px - dx * 0.45, pz - dz * 0.45, x, z), drop: { x: px + dx * 0.5, z: pz + dz * 0.5 } };
+  }
+  function startMyBoat(text) {
+    const f = me.friend;
+    if (me.trip || f.walk || !f.root.visible || me.seat < 0) return false;
+    const fromSeat = !f.free;
+    if (fromSeat) { standUp(f); onMeStood(); }
+    const fr = f.free, spot = findShore(fr.x, fr.z);
+    carryBoat(f, text);
+    me.trip = { phase: "go", fromSeat, spot, t: 0 };
+    setAct(f, "carry");
+    markerOn(spot.stand.x, spot.stand.z);
+    setPath(planPath(fr.x, fr.z, spot.stand.x, spot.stand.z), () => {
+      markerOff();
+      if (!me.trip) return;
+      me.trip.phase = "place"; me.trip.t = 0;
+      const d = me.trip.spot.drop; fr.ry = Math.atan2(d.x - fr.x, d.z - fr.z);
+      setAct(f, "place"); pushState(true);
+    });
+    pushState(true);
+    return true;
+  }
+  function updateMyTrip(dt) {
+    const tr = me.trip, f = me.friend;
+    if (!tr || tr.phase === "go") return;
+    tr.t += dt;
+    if (tr.phase === "place") {
+      if (tr.t >= 0.8 && f.carried) { launchFrom(f, tr.spot.drop.x, tr.spot.drop.z); sendBoat(tr.spot.drop.x, tr.spot.drop.z); }
+      if (tr.t >= 1.6) { tr.phase = "wave"; tr.t = 0; setAct(f, "wave"); pushState(true); }
+    } else if (tr.phase === "wave" && tr.t >= 2.4) {
+      setAct(f, ""); me.trip = null;
+      document.getElementById("btn-boat").disabled = false;
+      if (tr.fromSeat) { showStatus("종이배가 멀리 떠가요. 자리로 돌아가요."); goSit(me.seat); }
+      else showStatus("종이배가 멀리 떠가요.");
+      pushState(true);
+    }
+  }
+
+  function updateMe(dt) {
+    const f = me.friend;
+    if (keys.has("KeyQ")) goal.theta += 1.6 * dt;
+    if (keys.has("KeyE")) goal.theta -= 1.6 * dt;
+    let ix = 0, iy = 0;
+    keys.forEach(k => { const m = MOVE_KEYS[k]; if (m) { ix += m[0]; iy += m[1]; } });
+    const wantsMove = (ix !== 0 || iy !== 0) && !me.trip;
+    if (wantsMove && !f.free && !f.walk && f.root.visible && me.seat >= 0) { standUp(f); onMeStood(); }
+    const fr = f.free;
+    if (!fr) return;
+    const ox = fr.x, oz = fr.z;
+    let mx = 0, mz = 0;
+    if (!f.trans) {
+      if (wantsMove) {
+        if (fr.path) { fr.path = null; fr.onArrive = null; markerOff(); }   // 키를 누르면 클릭 목적지는 취소
+        const fx = -Math.sin(cur.theta), fz = -Math.cos(cur.theta), rx = -fz, rz = fx;   // 화면 안쪽이 앞
+        const vx = fx * iy + rx * ix, vz = fz * iy + rz * ix, l = Math.hypot(vx, vz) || 1;
+        mx = vx / l * WALK_SPEED * dt; mz = vz / l * WALK_SPEED * dt;
+      } else if (fr.path && fr.path.length) {
+        const tg = fr.path[0], dx = tg.x - fr.x, dz = tg.z - fr.z, d = Math.hypot(dx, dz);
+        if (d < 0.08) {
+          fr.path.shift();
+          if (!fr.path.length) { fr.path = null; markerOff(); const cb = fr.onArrive; fr.onArrive = null; if (cb) cb(); }
+        } else { const s = Math.min(d, WALK_SPEED * dt); mx = dx / d * s; mz = dz / d * s; }
+      }
+    }
+    if (mx || mz) {
+      const r = resolveMove(ox, oz, ox + mx, oz + mz);
+      fr.x = r.x; fr.z = r.z;
+      fr.ry = Math.atan2(mx, mz);
+      if (fr.path) {   // 막혀서 거의 못 가면 목적지를 포기 (종이배 중이면 그 자리에서 내려놓는다)
+        const got = Math.hypot(r.x - ox, r.z - oz), want = Math.hypot(mx, mz);
+        fr.stuckT = got < want * 0.3 ? (fr.stuckT || 0) + dt : 0;
+        if (fr.stuckT > 1.2) {
+          fr.path = null; markerOff();
+          const cb = fr.onArrive; fr.onArrive = null;
+          if (me.trip && cb) { me.trip.spot = findShore(fr.x, fr.z); cb(); }
+          else showStatus("길이 막혀서 멈췄어요.");
+        }
+      }
+    }
+    if (me.friend.free) fr.speed = Math.hypot(fr.x - ox, fr.z - oz) / Math.max(dt, 1e-4);
+    updateMyTrip(dt);
+    pushState(false);
+  }
+
+  // 서 있거나 걷는 동물 그리기 (나와 다른 사람 공통)
+  function updateFree(f, dt, t) {
+    const fr = f.free;
+    if (!f.isMe && !f.trans) {   // 받은 위치로 부드럽게 따라가기
+      const dx = fr.tx - fr.x, dz = fr.tz - fr.z, d = Math.hypot(dx, dz), ox = fr.x, oz = fr.z;
+      if (d > 6) { fr.x = fr.tx; fr.z = fr.tz; }
+      else if (d > 0.005) { const s = Math.min(d, Math.max(1.7, d * 2.5) * dt); fr.x += dx / d * s; fr.z += dz / d * s; }
+      fr.speed = Math.hypot(fr.x - ox, fr.z - oz) / Math.max(dt, 1e-4);
+    }
+    const hold = () => { f.arms[0].rotation.set(-1.25, 0, 0.24); f.arms[1].rotation.set(-1.25, 0, -0.24); };
+    f.head.rotation.set(0.08, 0, Math.sin(t * 1.5) * 0.04);
+    if (f.carried) flickCarried(f.carried);
+    if (f.trans) {   // 의자에서 폴짝 내려오기
+      f.trans.t += dt;
+      const s = Math.min(1, f.trans.t / 0.55), a = f.trans.from, b = f.trans.to, gy = groundH(b.x, b.z);
+      f.root.position.set(a.x + (b.x - a.x) * s, a.y + (gy - a.y) * s + Math.sin(Math.PI * s) * 0.2, a.z + (b.z - a.z) * s);
+      f.root.rotation.y += wrapPi(fr.ry - f.root.rotation.y) * Math.min(1, dt * 8);
+      pose(f, 1 - smoothstep(0, 0.8, s), t, false);
+      if (f.act === "carry") hold(); else { f.arms[0].rotation.set(-0.3, 0, -0.2); f.arms[1].rotation.set(-0.3, 0, 0.2); }
+      if (s >= 1) f.trans = null;
+      return;
+    }
+    f.actT = (f.actT || 0) + dt;
+    const walking = fr.speed > 0.15;
+    let hopY = 0;
+    if (f.hop > 0) { f.hop = Math.max(0, f.hop - dt * 1.4); hopY = Math.abs(Math.sin((1 - f.hop) * Math.PI * 2)) * 0.16 * f.hop; }
+    f.root.position.set(fr.x, groundH(fr.x, fr.z) + hopY + (walking ? Math.abs(Math.sin(t * 9)) * 0.03 : 0), fr.z);
+    f.root.rotation.y += wrapPi(fr.ry - f.root.rotation.y) * Math.min(1, dt * 10);
+    f.bodyG.rotation.z = walking ? Math.sin(t * 9) * 0.08 : f.bodyG.rotation.z * 0.85;
+    const bend = f.act === "place" ? Math.sin(Math.PI * Math.min(1, f.actT / 1.6)) : 0;
+    pose(f, 0.42 * bend, t, walking && f.act !== "place");
+    f.bodyG.rotation.x = 0.5 * bend;
+    if (f.tail) f.tail.rotation.y = Math.sin(t * (walking ? 6 : 2.2)) * 0.35;
+    const w = f.warmK = (f.warmK || 0) + ((f.warming ? 1 : 0) - (f.warmK || 0)) * Math.min(1, dt * 4);
+    if (f.act === "carry") hold();
+    else if (f.act === "place") { f.arms[0].rotation.set(-1.25 - 0.45 * bend, 0, 0.24); f.arms[1].rotation.set(-1.25 - 0.45 * bend, 0, -0.24); }
+    else if (f.act === "wave") { f.arms[0].rotation.set(0, 0, -2.4 + Math.sin(t * 14) * 0.35); f.arms[1].rotation.set(-0.3, 0, -0.25); }
+    else if (walking) walkArms(f, t);
+    else {   // 서 있을 때: 팔을 늘어뜨리고, '불 쬐기' 중이면 불 쪽으로 내민다
+      const rub = Math.sin(t * 3.2) * 0.07 * w, sway = Math.sin(t * 0.9) * 0.04;
+      f.arms[0].rotation.set(-0.1 - 0.95 * w + rub + sway, 0, -0.12 + 0.42 * w);
+      f.arms[1].rotation.set(-0.1 - 0.95 * w - rub + sway, 0, 0.12 - 0.42 * w);
+    }
+    if (f.hop > 0 && f.act === "") f.arms[0].rotation.set(0, 0, -2.4 + Math.sin((1 - f.hop) * 30) * 0.3);
+  }
+
   /* ---------- 여러 명이 함께: Trystero (서버 없이 브라우저끼리 직접 연결) ----------
      - 모닥불 하나 = Trystero 방 하나 ("fire-1", "fire-2", …)
      - 먼저 들어온 순서(joinedAt, peerId)로 12명까지 그 불에 앉고, 13번째부터는 다음 불로 간다
@@ -1103,12 +1435,31 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   drawTag(me.friend);
 
   const peers = new Map();          // peerId -> { st, friend, lastWave }
+  const rate = new Map();           // peerId -> 1초 동안 받은 상태 메시지 수
   let T = null, room = null, selfId = "solo-" + Math.random().toString(36).slice(2, 10);
   let sendState = () => {}, sendWave = () => {}, sendBoat = () => {};
   let fireNo = 1, joinToken = 0, discovering = true, online = false, autoSit = true;
 
-  const myState = () => ({ species: me.def.species, name: me.def.name, boots: me.def.boots, mitten: me.def.mitten,
-                           seat: me.seat, warming: me.warming, joinedAt: me.joinedAt });
+  const r2 = v => Math.round(v * 100) / 100;
+  function myState() {
+    const f = me.friend, fr = f.free;
+    const x = fr ? fr.x : f.root.position.x, z = fr ? fr.z : f.root.position.z;
+    return { species: me.def.species, name: me.def.name, boots: me.def.boots, mitten: me.def.mitten,
+             seat: me.seat, warming: me.warming, joinedAt: me.joinedAt,
+             // 걸어 다니기: 위치(cm)·바라보는 방향·자세·동작. 글자는 하나도 들어가지 않는다.
+             x: r2(x), z: r2(z), ry: r2(fr ? fr.ry : f.root.rotation.y),
+             pose: fr ? (fr.speed > 0.15 ? "walk" : "stand") : "sit",
+             act: f.act || "" };
+  }
+  // 바뀐 것이 있을 때만, 1초에 최대 5번 보낸다
+  let lastSentAt = 0, sendTimer = 0, lastSig = "";
+  function pushState(force) {
+    const s = myState(), sig = [s.pose, s.act, s.seat, s.warming, s.x, s.z, s.ry].join("|");
+    if (!force && sig === lastSig) return;
+    const wait = 200 - (performance.now() - lastSentAt);
+    if (wait <= 0) { lastSentAt = performance.now(); lastSig = sig; sendState(); }
+    else if (!sendTimer) sendTimer = setTimeout(() => { sendTimer = 0; pushState(true); }, wait);
+  }
   const before = (a, aid, b, bid) => a.joinedAt < b.joinedAt || (a.joinedAt === b.joinedAt && aid < bid);
 
   // 받은 값 검증: 정해진 목록 밖의 값은 버리거나 기본값으로 바꾼다
@@ -1119,12 +1470,17 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     const adj = name.endsWith(" " + species) ? name.slice(0, name.length - species.length - 1) : null;
     if (!adj || !ADJ.includes(adj)) name = species;
     const seat = Number.isInteger(d.seat) && d.seat >= -1 && d.seat < SEAT_N ? d.seat : -1;
+    const pose = ["sit", "stand", "walk"].includes(d.pose) ? d.pose : "sit";
+    const act = ["", "carry", "place", "wave"].includes(d.act) ? d.act : "";
+    // 위치는 걸을 수 있는 곳 안으로 당겨 넣는다 (호수·모닥불·12m 밖이면 가장 가까운 가장자리로)
+    const c = clampWalk(Number.isFinite(d.x) ? d.x : 0, Number.isFinite(d.z) ? d.z : WALK_R);
     return {
       species, name,
       boots: BOOTS.includes(d.boots) ? d.boots : BOOTS[0],
       mitten: MITTENS.includes(d.mitten) ? d.mitten : MITTENS[0],
       seat, warming: d.warming === true,
-      joinedAt: Number.isFinite(d.joinedAt) ? d.joinedAt : Date.now()
+      joinedAt: Number.isFinite(d.joinedAt) ? d.joinedAt : Date.now(),
+      x: c.x, z: c.z, ry: Number.isFinite(d.ry) ? wrapPi(d.ry) : 0, pose, act
     };
   }
 
@@ -1161,7 +1517,10 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   function refreshHidden() {
     peers.forEach(p => {
       const f = p.friend;
-      if (f && p.st && p.st.seat >= 0 && !f.root.visible && !SEATS[p.st.seat].friend) seatFriend(f, p.st.seat, false);
+      if (f && p.st && p.st.seat >= 0 && !f.root.visible && !SEATS[p.st.seat].friend) {
+        if (p.st.pose !== "sit") { reserveSeat(f, p.st.seat); placeFree(f, p.st); }
+        else seatFriend(f, p.st.seat, false);
+      }
     });
   }
 
@@ -1196,6 +1555,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     const f = p.friend;
     f.warming = st.warming;
     f.joinedAt = st.joinedAt;
+    const standing = st.pose !== "sit";
     if (st.seat !== f.seat || !f.root.visible) {
       // 같은 의자를 두 사람이 고르면 먼저 온 사람이 앉는다 (늦게 온 쪽은 곧 스스로 다른 자리로 옮긴다)
       const occ = st.seat >= 0 ? SEATS[st.seat].friend : null;
@@ -1205,15 +1565,22 @@ button.primary{border-color:var(--ember);color:var(--ember)}
         seatFriend(f, -1, false);           // 내 자리와 겹침: evaluate가 순서를 따져 정리한다
       } else {
         if (occ && occ !== f) seatFriend(occ, -1, false);
-        seatFriend(f, st.seat, !discovering && st.seat >= 0);
+        if (standing && st.seat >= 0) { reserveSeat(f, st.seat); placeFree(f, st); }   // 서 있는 사람: 의자는 맡아 두고 그 자리에 세운다
+        else seatFriend(f, st.seat, !discovering && st.seat >= 0);
       }
+    } else if (standing && !f.free) {
+      enterFreeRemote(f, st);               // 앉아 있던 사람이 일어남
+    } else if (!standing && f.free) {
+      seatFriend(f, st.seat, true);         // 걸어 다니던 사람이 다시 앉음
     }
+    if (standing && f.free) { f.free.tx = st.x; f.free.tz = st.z; f.free.ry = st.ry; }
+    setAct(f, st.act);
     evaluate();
   }
 
   function peerLeft(id) {
     const p = peers.get(id);
-    peers.delete(id);
+    peers.delete(id); rate.delete(id);
     if (p && p.friend) {
       showStatus(josa(p.friend.name, "이", "가") + " 손을 흔들고 숲으로 돌아가요.");
       walkHome(p.friend);
@@ -1233,7 +1600,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   }
 
   function clearRoom() {
-    cancelTrip(me.friend);
+    leaveFree(me.friend);
     peers.forEach(p => { if (p.friend) removeFriend(p.friend); });
     peers.clear();
     vacate(me.friend);
@@ -1265,12 +1632,21 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     const stAct = room.makeAction("state"), wvAct = room.makeAction("wave");
     sendState = target => { if (token === joinToken) stAct.send(myState(), target ? { target } : undefined).catch(() => {}); };
     sendWave = () => { if (token === joinToken) wvAct.send(1).catch(() => {}); };
-    // 종이배 신호: 내용 없이 숫자 1만 보낸다. 적은 글은 절대 보내지 않는다.
+    // 종이배 신호: 배를 물에 내려놓은 자리(x, z 숫자 두 개)만 보낸다. 적은 글은 절대 보내지 않는다.
     const btAct = room.makeAction("boat");
-    sendBoat = () => { if (token === joinToken) btAct.send(1).catch(() => {}); };
-    btAct.onMessage = (_, meta) => { if (token === joinToken && meta) peerBoat(meta.peerId); };
+    sendBoat = (x, z) => { if (token === joinToken) btAct.send({ x: r2(x), z: r2(z) }).catch(() => {}); };
+    btAct.onMessage = (data, meta) => {
+      if (token !== joinToken || !meta || !data || !Number.isFinite(data.x) || !Number.isFinite(data.z)) return;
+      if (groundH(data.x, data.z) > 0.05 || Math.hypot(data.x, data.z) > WALK_R + 4) return;   // 물 위, 모닥불 근처만
+      peerBoat(meta.peerId, data.x, data.z);
+    };
     stAct.onMessage = (data, meta) => {
       if (token !== joinToken || !meta || typeof meta.peerId !== "string") return;
+      // 한 사람이 1초에 15번보다 많이 보내면 넘치는 것은 버린다
+      const now = performance.now(), rl = rate.get(meta.peerId) || { t: now, n: 0 };
+      if (now - rl.t > 1000) { rl.t = now; rl.n = 0; }
+      rl.n++; rate.set(meta.peerId, rl);
+      if (rl.n > 15) return;
       const s = sanitize(data);
       if (s) applyPeer(meta.peerId, s);
     };
@@ -1470,71 +1846,6 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     return { group, mat, glow, label, floating: false, age: 0, phase: Math.random() * 6, dir: new THREE.Vector2(0, -1), fade: 1 };
   }
 
-  // 물가 자리: 의자마다 정해진 곳이라 모든 화면에서 같은 곳으로 걸어간다
-  function shoreSpot(seatIndex) {
-    const th = SEATS[seatIndex].th;
-    const x = Math.max(-3.4, Math.min(3.4, Math.sin(th) * 3.2 + (Math.cos(th) > 0 ? 0.35 : -0.35)));
-    let z = -2.5;
-    while (z > -14 && groundH(x, z) > 0.06) z -= 0.05;
-    return { stand: new THREE.Vector3(x, 0, z + 0.45), drop: new THREE.Vector3(x, 0.012, z - 0.4) };
-  }
-  // 의자 둘레를 돌아(불을 가로지르지 않게) 물가로 가는 길
-  function tripPath(seatIndex, spot) {
-    const th = SEATS[seatIndex].th, R = SEAT_R + 0.55;
-    const pts = [seatFoot(th)];
-    const target = Math.atan2(spot.stand.x, spot.stand.z);
-    const d = wrapPi(target - th);
-    const steps = Math.ceil(Math.abs(d) / 0.25);
-    for (let k = 1; k <= steps; k++) { const a = th + d * k / steps; pts.push(new THREE.Vector3(Math.sin(a) * R, 0, Math.cos(a) * R)); }
-    pts.push(spot.stand.clone());
-    return pts;
-  }
-  function along(pts, dist) {
-    for (let i = 0; i < pts.length - 1; i++) {
-      const a = pts[i], b = pts[i + 1], len = Math.hypot(b.x - a.x, b.z - a.z);
-      if (dist <= len || i === pts.length - 2) {
-        const s = len > 0 ? Math.min(1, dist / len) : 1;
-        return { x: a.x + (b.x - a.x) * s, z: a.z + (b.z - a.z) * s, dx: b.x - a.x, dz: b.z - a.z, done: i === pts.length - 2 && dist >= len };
-      }
-      dist -= len;
-    }
-    const l = pts[pts.length - 1];
-    return { x: l.x, z: l.z, dx: 0, dz: -1, done: true };
-  }
-
-  function startTrip(f, text) {
-    if (f.seat < 0 || f.walk || f.trip) return false;
-    const spot = shoreSpot(f.seat), path = tripPath(f.seat, spot);
-    const boat = makeBoat(text);
-    boat.group.position.set(0, 0.27, 0.3);
-    f.bodyG.add(boat.group);
-    f.trip = { phase: "stand", t: 0, dist: 0, spot, path, rev: path.slice().reverse(), boat };
-    f.tagT = Math.max(f.tagT, 3);
-    return true;
-  }
-  function cancelTrip(f) {
-    if (!f || !f.trip) return;
-    const b = f.trip.boat;
-    if (b && !b.floating) f.bodyG.remove(b.group);
-    f.bodyG.rotation.x = 0; f.bodyG.rotation.z = 0;
-    f.trip = null;
-    if (f.isMe) btnBoat.disabled = me.seat < 0;
-  }
-
-  function launchBoat(f, tr) {
-    const b = tr.boat;
-    f.bodyG.remove(b.group);
-    b.group.position.copy(tr.spot.drop);
-    const out = new THREE.Vector2(LAKE.cx - tr.spot.drop.x, LAKE.cz - tr.spot.drop.z).normalize().rotateAround(new THREE.Vector2(), (Math.random() - 0.5) * 0.5);
-    b.dir.copy(out);
-    b.group.rotation.set(0, Math.atan2(-b.dir.y, b.dir.x), 0);
-    b.floating = true; b.age = 0;
-    if (b.label) b.label.visible = true;
-    scene.add(b.group);
-    boats.push(b);
-    while (boats.length > MAX_BOATS) removeBoat(boats[0]);
-    plop();
-  }
   function removeBoat(b) {
     scene.remove(b.group);
     if (b.label) { b.label.material.map.dispose(); b.label.material.dispose(); b.label = null; }   // 글이 그려진 캔버스도 버린다
@@ -1571,64 +1882,6 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     b.mat.emissive.setRGB(0.3 * fl, 0.14 * fl, 0.04);
   }
 
-  function updateTrip(f, dt) {
-    const tr = f.trip, t = time + f.phase;
-    tr.t += dt;
-    const seatTh = SEATS[f.seat].th, top = seatTop(seatTh), foot = tr.path[0];
-    const next = p => { tr.phase = p; tr.t = 0; tr.dist = 0; };
-    const hold = () => { f.arms[0].rotation.set(-1.25, 0, 0.24); f.arms[1].rotation.set(-1.25, 0, -0.24); };
-    const turnTo = (yaw, k) => { f.root.rotation.y += wrapPi(yaw - f.root.rotation.y) * Math.min(1, dt * k); };
-    f.head.rotation.set(0.12, 0, Math.sin(t * 1.5) * 0.04);
-    if (!tr.boat.floating) flickCarried(tr.boat);
-
-    if (tr.phase === "stand") {                       // 의자에서 내려와 배를 들고 서기
-      const s = Math.min(1, tr.t / 0.7), gy = groundH(foot.x, foot.z);
-      f.root.position.set(top.x + (foot.x - top.x) * s, top.y + (gy - top.y) * s + Math.sin(Math.PI * s) * 0.2, top.z + (foot.z - top.z) * s);
-      const p1 = tr.path[1];
-      turnTo(Math.atan2(p1.x - foot.x, p1.z - foot.z), 6);
-      pose(f, 1 - smoothstep(0, 0.7, s), t, false); hold();
-      if (s >= 1) next("go");
-    } else if (tr.phase === "go" || tr.phase === "back") {   // 걸어가기 / 돌아오기
-      tr.dist += dt * 1.1;
-      const p = along(tr.phase === "go" ? tr.path : tr.rev, tr.dist);
-      f.root.position.set(p.x, groundH(p.x, p.z) + Math.abs(Math.sin(t * 9)) * 0.03, p.z);
-      if (p.dx || p.dz) turnTo(Math.atan2(p.dx, p.dz), 8);
-      f.bodyG.rotation.z = Math.sin(t * 9) * 0.08;
-      pose(f, 0, t, true);
-      if (tr.phase === "go") hold(); else walkArms(f, t);
-      if (p.done) { f.bodyG.rotation.z = 0; next(tr.phase === "go" ? "place" : "sit"); }
-    } else if (tr.phase === "place") {                // 쪼그려 앉아 물에 내려놓기
-      const s = Math.min(1, tr.t / 1.6), bend = Math.sin(Math.PI * s);
-      const d = tr.spot.drop;
-      turnTo(Math.atan2(d.x - f.root.position.x, d.z - f.root.position.z), 6);
-      pose(f, 0.42 * bend, t, false);
-      f.bodyG.rotation.x = 0.5 * bend;
-      f.arms[0].rotation.set(-1.25 - 0.45 * bend, 0, 0.24); f.arms[1].rotation.set(-1.25 - 0.45 * bend, 0, -0.24);
-      if (s >= 0.5 && !tr.boat.floating) launchBoat(f, tr);
-      if (s >= 1) { f.bodyG.rotation.x = 0; next("wave"); }
-    } else if (tr.phase === "wave") {                 // 떠나는 배에게 손 흔들기
-      pose(f, 0, t, false);
-      f.arms[0].rotation.set(0, 0, -2.4 + Math.sin(t * 14) * 0.35);
-      f.arms[1].rotation.set(-0.3, 0, -0.25);
-      f.head.rotation.set(0.05, 0, Math.sin(t * 2) * 0.1);
-      if (tr.t >= 2.4) next("back");
-    } else if (tr.phase === "sit") {                  // 의자로 폴짝 올라가 다시 앉기
-      const s = Math.min(1, tr.t / 0.7), gy = groundH(foot.x, foot.z);
-      f.root.position.set(foot.x + (top.x - foot.x) * s, gy + (top.y - gy) * s + Math.sin(Math.PI * s) * 0.3, foot.z + (top.z - foot.z) * s);
-      turnTo(seatTh + Math.PI, 7);
-      pose(f, smoothstep(0.3, 1, s), t, false);
-      if (s >= 1) {
-        f.trip = null;
-        f.root.position.copy(top); f.root.rotation.y = seatTh + Math.PI; f.baseY = top.y;
-        if (f.isMe) {
-          btnBoat.disabled = false;
-          showStatus("종이배가 멀리 떠가요. 다시 자리에 앉았어요.");
-          if (tripCam) { tripCam = false; sitDown(); }
-        }
-      }
-    }
-  }
-
   function plop() {
     if (!audio || !soundOn) return;
     const { ctx, master } = audio, now = ctx.currentTime;
@@ -1639,19 +1892,20 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     o.connect(g).connect(master); o.start(now); o.stop(now + 0.32);
   }
 
-  function peerBoat(id) {
+  // 다른 사람이 배를 물에 내려놓았다는 신호 (그 사람이 걸어간 길은 위치 메시지로 이미 따라왔다)
+  function peerBoat(id, x, z) {
     const p = peers.get(id), now = performance.now();
     if (!p || !p.friend || !p.friend.root.visible) return;
     if (p.lastBoat && now - p.lastBoat < 8000) return;   // 너무 잦은 신호는 무시
     p.lastBoat = now;
-    if (startTrip(p.friend, null)) showStatus(josa(p.friend.name, "이", "가") + " 종이배를 띄우러 호숫가로 가요.");
+    launchFrom(p.friend, x, z);
+    showStatus(josa(p.friend.name, "이", "가") + " 종이배를 띄웠어요.");
   }
 
   // 걱정 적는 칸
   const btnBoat = document.getElementById("btn-boat");
   const boatForm = document.getElementById("boat-form");
   const worryEl = document.getElementById("worry");
-  let tripCam = false;
   function openSheet() { document.getElementById("invite-sheet").hidden = true; boatForm.hidden = false; worryEl.value = ""; setTimeout(() => worryEl.focus(), 30); }
   function closeSheet() { boatForm.hidden = true; worryEl.value = ""; btnBoat.focus(); }
   btnBoat.addEventListener("click", () => { interacted(); if (boatForm.hidden) openSheet(); else closeSheet(); });
@@ -1659,15 +1913,13 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   boatForm.addEventListener("keydown", e => { if (e.key === "Escape") closeSheet(); });
   boatForm.addEventListener("submit", e => {
     e.preventDefault();
-    if (me.seat < 0 || me.friend.walk || me.friend.trip) { showStatus("자리에 앉은 뒤에 띄울 수 있어요."); return; }
+    if (me.seat < 0 || me.friend.walk || me.trip || !me.friend.root.visible) { showStatus("자리에 앉은 뒤에 띄울 수 있어요."); return; }
     const text = worryEl.value.trim();
     worryEl.value = "";              // 입력 칸에서 바로 지운다
     boatForm.hidden = true;
-    if (!startTrip(me.friend, text)) return;
+    if (!startMyBoat(text)) return;  // 다른 사람에게는 걸어가는 위치와, 물에 놓는 순간의 (x, z)만 간다
     btnBoat.disabled = true;
-    sendBoat();                      // 글 없이 신호만
     showStatus(text ? "걱정을 실은 종이배를 들고 호숫가로 가요." : "종이배를 들고 호숫가로 가요.");
-    if (cur.rad < 6) { tripCam = true; goal.rad = 7.5; }
   });
 
   /* ---------- 호수 (평면 반사) ---------- */
@@ -1711,7 +1963,8 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   const cur = { theta: 0, rad: FAR_R }, goal = { theta: 0, rad: FAR_R };
   const lookTarget = new THREE.Vector3();
   let lastInteract = performance.now();
-  const clampR = r => Math.min(MAX_R, Math.max(MIN_R, r));
+  const following = () => !!me.friend.free && !camFar;
+  const clampR = r => following() ? Math.min(10, Math.max(2.2, r)) : Math.min(MAX_R, Math.max(MIN_R, r));
   const nearestAngle = (from, to) => to + Math.PI * 2 * Math.round((from - to) / (Math.PI * 2));
   // 내 자리 바로 뒤에서 내 동물의 어깨 너머로 불을 본다
   function sitDown() {
@@ -1719,14 +1972,26 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     goal.theta = nearestAngle(cur.theta, th); goal.rad = SIT_R; lastInteract = performance.now();
   }
 
+  // 앉아 있거나 '멀리서 보기'면 모닥불을 중심으로, 서서 걸으면 내 동물을 중심으로 돈다 (두 시점 사이는 부드럽게 넘어간다)
+  const camCenter = new THREE.Vector3(0, G0, 0), camA = new THREE.Vector3(), camB = new THREE.Vector3();
+  const lookA = new THREE.Vector3(), lookB = new THREE.Vector3(), tmpC = new THREE.Vector3();
+  let followK = 0;
   function updateCamera(dt) {
     const k = Math.min(1, dt * 4.5);
     cur.theta += (goal.theta - cur.theta) * k;
     cur.rad += (goal.rad - cur.rad) * k;
-    const t = Math.max(0, (cur.rad - MIN_R) / (FAR_R - MIN_R));
-    camera.position.set(Math.sin(cur.theta) * cur.rad, G0 + 1.8 + 1.2 * t, Math.cos(cur.theta) * cur.rad);
-    const reach = 1.2 + 4.2 * t;
-    lookTarget.set(-Math.sin(cur.theta) * reach, G0 + 0.7 + 0.6 * t, -Math.cos(cur.theta) * reach);
+    const fr = me.friend.free;
+    followK += ((following() ? 1 : 0) - followK) * Math.min(1, dt * 3);
+    if (fr) camCenter.lerp(tmpC.set(fr.x, groundH(fr.x, fr.z), fr.z), Math.min(1, dt * 6));
+    const s = Math.sin(cur.theta), c = Math.cos(cur.theta);
+    const t = Math.max(0, (cur.rad - MIN_R) / (FAR_R - MIN_R)), reach = 1.2 + 4.2 * t;
+    camA.set(s * cur.rad, G0 + 1.8 + 1.2 * t, c * cur.rad);
+    lookA.set(-s * reach, G0 + 0.7 + 0.6 * t, -c * reach);
+    const u = Math.max(0, (cur.rad - 2.2) / 6), r2b = 0.6 + 1.8 * u;
+    camB.set(camCenter.x + s * cur.rad, camCenter.y + 1.5 + 1.5 * u, camCenter.z + c * cur.rad);
+    lookB.set(camCenter.x - s * r2b, camCenter.y + 0.6 + 0.3 * u, camCenter.z - c * r2b);
+    camera.position.lerpVectors(camA, camB, followK);
+    lookTarget.lerpVectors(lookA, lookB, followK);
     camera.lookAt(lookTarget);
   }
 
@@ -1763,13 +2028,18 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("wheel", e => { e.preventDefault(); interacted(); goal.rad = clampR(goal.rad * (1 + e.deltaY * 0.0012)); }, { passive: false });
+  // 키보드: WASD·방향키로 걷기, Q/E로 둘러보기, +/-로 거리 조절. 글 쓰는 중에는 아무것도 하지 않는다.
   addEventListener("keydown", e => {
-    if (e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT")) return;   // 글 쓰는 중엔 화면을 돌리지 않는다
-    if (e.key === "ArrowLeft") { goal.theta += 0.15; interacted(); }
-    else if (e.key === "ArrowRight") { goal.theta -= 0.15; interacted(); }
-    else if (e.key === "ArrowUp") { goal.rad = clampR(goal.rad * 0.9); interacted(); }
-    else if (e.key === "ArrowDown") { goal.rad = clampR(goal.rad * 1.1); interacted(); }
+    if (e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT")) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (MOVE_KEYS[e.code] || e.code === "KeyQ" || e.code === "KeyE") {
+      keys.add(e.code); interacted();
+      if (e.code.startsWith("Arrow")) e.preventDefault();
+    } else if (e.key === "+" || e.key === "=") { goal.rad = clampR(goal.rad * 0.9); interacted(); }
+    else if (e.key === "-" || e.key === "_") { goal.rad = clampR(goal.rad * 1.1); interacted(); }
   });
+  addEventListener("keyup", e => keys.delete(e.code));
+  addEventListener("blur", () => keys.clear());
 
   const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2();
   function pick(e) {
@@ -1783,16 +2053,18 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     if (hit.object.userData.seat !== undefined) return { seat: hit.object.userData.seat };
     return null;
   }
-  // 누르면 이름표만 보여 준다 (다른 사람에게 보내는 신호는 버튼으로만)
+  // 누르기: 동물은 이름표, 의자는 가서 앉기(내 의자·빈 의자), 바닥·호수는 그쪽으로 걷기
   function tap(e) {
     const h = pick(e);
-    if (!h) return;
-    if (h.friend) h.friend.tagT = 3.5;
-    else if (h.seat !== undefined) {
-      const occupant = SEATS[h.seat].friend;
-      if (occupant) occupant.tagT = 3.5;
-      else showStatus("빈 의자예요. 누군가 이 링크로 들어오면 숲에서 걸어와 앉아요.");
+    if (h && h.friend) { h.friend.tagT = 3.5; return; }
+    if (h && h.seat !== undefined) {
+      const occ = SEATS[h.seat].friend;
+      if (occ && occ !== me.friend) { occ.tagT = 3.5; return; }
+      goSit(h.seat);
+      return;
     }
+    const hit = raycaster.intersectObjects([groundMesh, water], false)[0];
+    if (hit) walkTo(hit.point.x, hit.point.z);
   }
   let hoverT = 0;
   function hover(e) {
@@ -1800,8 +2072,9 @@ button.primary{border-color:var(--ember);color:var(--ember)}
     const now = performance.now(); if (now - hoverT < 80) return; hoverT = now;
     canvas.style.cursor = pick(e) ? "pointer" : "grab";
   }
-  document.getElementById("btn-sit").addEventListener("click", () => { interacted(); sitDown(); });
-  document.getElementById("btn-far").addEventListener("click", () => { interacted(); autoSit = false; goal.rad = FAR_R; });
+  // 내 자리로: 서 있으면 걸어가서 앉고, 앉아 있으면 내 자리 시점으로
+  document.getElementById("btn-sit").addEventListener("click", () => { interacted(); if (me.seat >= 0) goSit(me.seat); else sitDown(); });
+  document.getElementById("btn-far").addEventListener("click", () => { interacted(); autoSit = false; camFar = true; goal.rad = FAR_R; });
 
   /* ---------- 소리 ---------- */
   let audio = null, soundOn = false;
@@ -1923,7 +2196,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
       if (f.blinkAt < -0.13) f.blinkAt = 2 + Math.random() * 4;
       f.eyes.forEach(e => { e.scale.y = blink ? 0.004 : e.userData.open; });
       if (f.walk) { updateWalker(f, dt); f.head.rotation.set(0, 0, Math.sin(t * 4.5) * 0.08); return; }
-      if (f.trip) { updateTrip(f, dt); return; }
+      if (f.free) { updateFree(f, dt, t); return; }
       // 고개: 가까이 앉으면 나를 바라보고, 아니면 불을 보며 갸웃
       let yawGoal = Math.sin(t * 0.4) * 0.25;
       if (close) {
@@ -1966,7 +2239,8 @@ button.primary{border-color:var(--ember);color:var(--ember)}
   function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000); last = now; time += dt;
 
-    if (!reduceMotion && now - lastInteract > 9000 && pointers.size === 0) goal.theta += dt * 0.025;
+    if (!reduceMotion && now - lastInteract > 9000 && pointers.size === 0 && !me.friend.free) goal.theta += dt * 0.025;
+    updateMe(dt);
     updateCamera(dt);
 
     popBoost = Math.max(0, popBoost - dt * 2.2);
@@ -2016,6 +2290,7 @@ button.primary{border-color:var(--ember);color:var(--ember)}
 
     updateFriends(dt);
     updateBoats(dt);
+    updateMarker(dt);
     starMat.uniforms.uTime.value = time;
     waterMat.uniforms.uTime.value = time;
 
